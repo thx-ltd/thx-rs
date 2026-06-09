@@ -1,0 +1,14 @@
+[package]
+name = "thx-dsp"
+description = "THX DSP framework and processors."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+bitflags = "2"
+
+[features]
+# Opt-in instrumentation utilities (signal generators, offline drivers, analyzers).
+# Always available to the crate's own tests; gate it on for external test crates.
+testing = []
