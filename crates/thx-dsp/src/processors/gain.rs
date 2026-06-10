@@ -14,64 +14,58 @@ use crate::common::{
 };
 
 /// Configuration for [`Gain`].
-///
-/// The layout is not configured here — it comes from the [`Spec`]'s input
-/// layout, which gain passes straight through to its output.
 #[derive(Clone, Debug, Default)]
 pub struct GainConfig {
     /// Gain in decibels (0 dB = unity, the default).
     pub gain_db: f64,
 }
 
-/// Time over which a gain change ramps to its new value, in milliseconds.
-const GAIN_SMOOTHING_MS: f64 = 10.0;
-
-/// Largest finite linear gain a [`FloatParam`] target is clamped to (≈ +60 dB).
-/// Bounds the smoother so a wild config can't produce a non-finite ramp.
-const MAX_LINEAR_GAIN: f64 = 1_000.0;
-
-/// Parameters shared between a [`Gain`] and its [`GainController`].
-///
-/// Smoothed in the linear-amplitude domain: the control thread converts dB to a
-/// linear target, the audio thread reads the smoothed factor per sample.
+/// Internal Parameters of a [`Gain`], shared between the processor and its
+/// controller.
 struct GainParams<S: Sample> {
-    gain: FloatParam<S>,
+    gain_lin: FloatParam<S>,
 }
 
 impl<S: Sample> GainParams<S> {
-    fn new(gain_db: f64) -> Self {
+    /// Build parameters resting at `config` — settled, so there is no ramp on the
+    /// first block.
+    fn new(config: &GainConfig) -> Self {
         Self {
-            gain: FloatParam::new(
-                db_to_linear(gain_db),
+            gain_lin: FloatParam::new(
+                db_to_linear(config.gain_db),
                 0.0..=MAX_LINEAR_GAIN,
                 SmoothingStyle::Linear(GAIN_SMOOTHING_MS),
             ),
         }
     }
+
+    /// Retarget the parameters from `config`, ramping at `spec`'s sample rate.
+    fn set(&self, spec: &Spec, config: &GainConfig) {
+        self.gain_lin
+            .set(spec.sample_rate, db_to_linear(config.gain_db));
+    }
 }
 
-/// The control-thread handle for a [`Gain`]. Reconfigures the running processor
-/// through the shared parameters.
+/// The control-thread handle for a [`Gain`].
 pub struct GainController<S: Sample> {
     params: Arc<GainParams<S>>,
-    sample_rate: f64,
+    spec: Spec,
 }
 
 impl<S: Sample> Controller for GainController<S> {
     type Config = GainConfig;
 
-    fn update(&mut self, config: &Self::Config) {
-        self.params
-            .gain
-            .set(self.sample_rate, db_to_linear(config.gain_db));
+    fn update(&mut self, spec: Spec, config: &Self::Config) {
+        self.spec = spec;
+        self.params.set(&self.spec, config);
     }
 
     fn reset(&mut self) {
-        self.params.gain.reset();
+        self.params.gain_lin.reset();
     }
 }
 
-/// A broadband gain (realtime half).
+/// The audio-thread processor for a [`Gain`].
 pub struct Gain<S: Sample> {
     spec: Spec,
     params: Arc<GainParams<S>>,
@@ -93,10 +87,10 @@ impl<S: Sample> Processor for Gain<S> {
             spec.layout,
         );
 
-        let params = Arc::new(GainParams::new(config.gain_db));
+        let params = Arc::new(GainParams::new(config));
         let controller = GainController {
             params: Arc::clone(&params),
-            sample_rate: spec.sample_rate,
+            spec,
         };
         let processor = Gain { spec, params };
         (controller, processor)
@@ -105,26 +99,14 @@ impl<S: Sample> Processor for Gain<S> {
     fn process(&mut self, buffer: &mut Buffer<'_, S>) {
         let frames = buffer.frames();
         let channels = buffer.out_channels();
-        let gain = &self.params.gain;
 
-        if gain.is_smoothing() {
-            // The gain moves within the block: advance the ramp once per frame
-            // and apply the same factor across every channel of that frame.
-            for i in 0..frames {
-                let g = gain.next();
-                for ch in 0..channels {
-                    let x = buffer.input(ch)[i];
-                    buffer.output_mut(ch)[i] = x * g;
-                }
-            }
-        } else {
-            // Settled: one constant factor, iterate channel-major for locality.
-            let g = gain.next();
+        // Reading the gain advances its smoothing, so take one value per frame
+        // and apply it across that frame's channels. No smoothing state to manage.
+        for i in 0..frames {
+            let g = self.params.gain_lin.next();
             for ch in 0..channels {
-                for i in 0..frames {
-                    let x = buffer.input(ch)[i];
-                    buffer.output_mut(ch)[i] = x * g;
-                }
+                let x = buffer.input(ch)[i];
+                buffer.output_mut(ch)[i] = x * g;
             }
         }
     }
@@ -137,6 +119,10 @@ impl<S: Sample> Processor for Gain<S> {
         &self.spec
     }
 }
+
+const GAIN_SMOOTHING_MS: f64 = 10.0;
+
+const MAX_LINEAR_GAIN: f64 = 1_000.0;
 
 const GAIN_LAYOUTS: &[ChannelMask] = &[
     ChannelMask::MASK_MONO,

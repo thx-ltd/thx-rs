@@ -71,12 +71,10 @@ pub trait Processor: Send + Sized {
     /// configurations.
     const OUTPUT_LAYOUTS: &'static [ChannelMask];
 
-    /// Construct a block for `spec`'s input layout, configured by `config`,
-    /// returning its [`Controller`] (for the control thread) and its realtime
+    /// Construct a processor with an initial `spec` and `config`.
+    /// Return its [`Controller`] (for the control thread) and its realtime
     /// `Processor` (to move to the audio thread). This fixes the output layout
     /// for the lifetime of the block.
-    ///
-    /// Heavy: may allocate and otherwise do real work. Call off the audio thread.
     ///
     /// `spec.layout` is expected to be one of [`INPUT_LAYOUTS`](Self::INPUT_LAYOUTS),
     /// and the resulting output layout one of [`OUTPUT_LAYOUTS`](Self::OUTPUT_LAYOUTS).
@@ -111,10 +109,8 @@ pub trait Controller: Send {
     /// processor.
     type Config: Clone + Send;
 
-    /// Reconfigure from a new `config`. The change is published to the running
-    /// processor through the shared parameters and (for smoothed parameters)
-    /// ramps in rather than jumping. Heavy: control thread only.
-    fn update(&mut self, config: &Self::Config);
+    /// Reconfigure from a new `spec` and `config`.
+    fn update(&mut self, spec: Spec, config: &Self::Config);
 
     /// Cancel any in-flight parameter smoothing, snapping values to their current
     /// targets. Heavy: control thread only.

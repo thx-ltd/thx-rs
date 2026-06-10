@@ -41,8 +41,8 @@
 //! let mut out_refs: Vec<&mut [f32]> = output.iter_mut().map(Vec::as_mut_slice).collect();
 //! let mut buffer = Buffer::new(&in_refs, &mut out_refs, 512);
 //!
-//! gain.process(&mut buffer);                       // audio thread
-//! controller.update(&GainConfig { gain_db: 0.0 }); // control thread: ramps in
+//! gain.process(&mut buffer);                             // audio thread
+//! controller.update(spec, &GainConfig { gain_db: 0.0 }); // control thread: ramps in
 //! ```
 //!
 //! [`process`]: Processor::process
