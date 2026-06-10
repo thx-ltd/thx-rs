@@ -5,4 +5,4 @@
 
 pub mod gain;
 
-pub use gain::{Gain, GainConfig};
+pub use gain::{Gain, GainConfig, GainController};

@@ -1,13 +1,25 @@
-//! The [`Processor`] trait: the shared contract for every DSP block.
+//! The [`Processor`] / [`Controller`] pair: the shared contract for every DSP
+//! block, split along the realtime boundary.
 //!
-//! A processor is built for a fixed [`Spec`] (sample rate, max block size, and
-//! input layout) plus a processor-specific [`Config`](Processor::Config). From
-//! those it fixes its [`output_layout`](Processor::output_layout). After that it
-//! just [`process`](Processor::process)es buffers in place, can be reconfigured
-//! with [`update`](Processor::update), and cleared with
-//! [`reset`](Processor::reset).
+//! Constructing a block with [`Processor::new`] yields **two halves**:
 //!
-//! [`Config`]: Processor::Config
+//! * the [`Processor`] — moved to the audio thread; its only live operation is
+//!   [`process`](Processor::process), which must be realtime-safe (no heap
+//!   allocation, no locking, no blocking);
+//! * the [`Controller`] — kept on a control/UI thread; its operations
+//!   ([`update`](Controller::update), [`reset`](Controller::reset)) may do heavy
+//!   work and must never run on the audio thread.
+//!
+//! Splitting the API this way makes the contract structural rather than a
+//! comment: the audio thread is handed a value whose surface is just `process`,
+//! so there is no `update`/`reset` to call there by accident. The two halves
+//! communicate through the shared, lock-free [parameters](crate::common::params)
+//! handed out at construction — the controller sets targets, the processor reads
+//! smoothed values, with no channel to wire up by hand.
+//!
+//! A block is built for a fixed [`Spec`] (sample rate, max block size, input
+//! layout) plus a processor-specific [`Config`](Processor::Config), which
+//! together fix the output layout for the processor's lifetime.
 
 use super::buffer::Buffer;
 use super::channel_mask::ChannelMask;
@@ -23,23 +35,25 @@ pub struct Spec {
     pub max_frames: usize,
     /// The speaker layout of the input buffers fed to [`Processor::process`].
     /// Together with the processor's [`Config`](Processor::Config) it fixes the
-    /// [`output_layout`](Processor::output_layout) at construction.
-    pub input_layout: ChannelMask,
+    /// [`output_spec`](Processor::output_spec) at construction.
+    pub layout: ChannelMask,
 }
 
 impl Spec {
     /// Convenience constructor.
-    #[must_use]
-    pub fn new(sample_rate: f64, max_frames: usize, input_layout: ChannelMask) -> Self {
+    pub fn new(sample_rate: f64, max_frames: usize, layout: ChannelMask) -> Self {
         Self {
             sample_rate,
             max_frames,
-            input_layout,
+            layout,
         }
     }
 }
 
-/// The shared behaviour of every DSP processor.
+/// The realtime half of a DSP block: lives on the audio thread and does nothing
+/// but [`process`](Self::process).
+///
+/// Obtain one (paired with its [`Controller`]) from [`new`](Self::new).
 pub trait Processor: Send + Sized {
     /// The scalar sample type this processor operates on.
     type Sample: Sample;
@@ -47,61 +61,62 @@ pub trait Processor: Send + Sized {
     /// User-facing configuration.
     type Config: Clone + Send;
 
-    /// Construct a processor for `spec`'s input layout, configured by `config`.
-    /// This fixes the [`output_layout`](Self::output_layout) for the lifetime of
-    /// the processor.
-    ///
-    /// `spec.input_layout` is expected to be one of
-    /// [`supported_input_layouts`](Self::supported_input_layouts), and the
-    /// resulting output layout one of
-    /// [`supported_output_layouts`](Self::supported_output_layouts).
-    fn new(spec: Spec, config: &Self::Config) -> Self;
+    /// The off-thread handle used to reconfigure this processor live.
+    type Controller: Controller<Config = Self::Config>;
 
-    /// Reconfigure in place from a new `config`.
-    fn update(&mut self, config: &Self::Config);
-
-    /// Process one [`Buffer`] in place.
-    fn process(&mut self, buffer: &mut Buffer<'_, Self::Sample>);
-
-    /// Clear internal state (filter memory, smoothing, etc.) as if freshly
-    /// started, e.g. after a transport stop or stream discontinuity.
-    fn reset(&mut self);
-
-    /// The spec this processor was built with.
-    fn spec(&self) -> &Spec;
-
-    /// The input speaker layout this processor consumes, taken from its
-    /// [`Spec`]. Always one of
-    /// [`supported_input_layouts`](Self::supported_input_layouts).
-    fn input_layout(&self) -> ChannelMask {
-        self.spec().input_layout
-    }
-
-    /// The output speaker layout this processor produces, fixed at construction
-    /// from the [`Spec`]'s input layout and the [`Config`](Self::Config). For a
-    /// layout-preserving block (e.g. gain) this equals
-    /// [`input_layout`](Self::input_layout); for a format-changing block (e.g.
-    /// an upmix) the config decides it (stereo in, 5.1 out). Always one of
-    /// [`supported_output_layouts`](Self::supported_output_layouts).
-    ///
-    /// There is no output layout without a configuration: the only way to obtain
-    /// one is to call this on a processor already built via [`new`](Self::new),
-    /// which is what fixes it.
-    fn output_layout(&self) -> ChannelMask;
-
-    /// The input layouts this processor type can be built for. Static: it
-    /// describes the processor *type*, independent of any instance or config —
-    /// useful for negotiating a layout before construction.
-    fn supported_input_layouts() -> &'static [ChannelMask];
+    /// The input layouts this processor supports.
+    const INPUT_LAYOUTS: &'static [ChannelMask];
 
     /// The output layouts this processor type can produce across all of its
-    /// configurations. Static: it describes the processor *type*, independent of
-    /// any instance or config.
-    fn supported_output_layouts() -> &'static [ChannelMask];
+    /// configurations.
+    const OUTPUT_LAYOUTS: &'static [ChannelMask];
+
+    /// Construct a block for `spec`'s input layout, configured by `config`,
+    /// returning its [`Controller`] (for the control thread) and its realtime
+    /// `Processor` (to move to the audio thread). This fixes the output layout
+    /// for the lifetime of the block.
+    ///
+    /// Heavy: may allocate and otherwise do real work. Call off the audio thread.
+    ///
+    /// `spec.layout` is expected to be one of [`INPUT_LAYOUTS`](Self::INPUT_LAYOUTS),
+    /// and the resulting output layout one of [`OUTPUT_LAYOUTS`](Self::OUTPUT_LAYOUTS).
+    fn new(spec: Spec, config: &Self::Config) -> (Self::Controller, Self);
+
+    /// Process one [`Buffer`] in place.
+    ///
+    /// **Realtime-safe:** no heap allocation, no locking, no blocking, no
+    /// unbounded work. Runs on the caller's audio thread.
+    fn process(&mut self, buffer: &mut Buffer<'_, Self::Sample>);
+
+    /// Current input spec of the processor.
+    fn input_spec(&self) -> &Spec;
+
+    /// Current output spec of the processor.
+    fn output_spec(&self) -> &Spec;
 
     /// Processing latency in frames (0 for a zero-delay block like gain). Useful
     /// for delay compensation and for asserting timing in tests.
     fn latency_frames(&self) -> usize {
         0
     }
+}
+
+/// The control half of a DSP block: the off-thread handle that reconfigures the
+/// running [`Processor`] through their shared, lock-free parameters.
+///
+/// Every method here may do heavy work (allocation, recomputation) and must
+/// **never** be called from the audio thread.
+pub trait Controller: Send {
+    /// User-facing configuration; matches [`Processor::Config`] of the paired
+    /// processor.
+    type Config: Clone + Send;
+
+    /// Reconfigure from a new `config`. The change is published to the running
+    /// processor through the shared parameters and (for smoothed parameters)
+    /// ramps in rather than jumping. Heavy: control thread only.
+    fn update(&mut self, config: &Self::Config);
+
+    /// Cancel any in-flight parameter smoothing, snapping values to their current
+    /// targets. Heavy: control thread only.
+    fn reset(&mut self);
 }

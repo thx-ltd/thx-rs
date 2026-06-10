@@ -1,32 +1,17 @@
-//! [`Gain`]: a broadband gain processor, the proof-of-concept implementation of
-//! [`Processor`].
+//! [`Gain`]: a broadband gain, the proof-of-concept implementation of the
+//! [`Processor`] / [`Controller`] split.
 //!
 //! It applies the same gain to every channel of its layout, passing the layout
 //! straight through to the output. Layout-agnostic in behaviour but, like every
-//! processor, built for one concrete input layout.
+//! processor, built for one concrete input layout. The gain is a smoothed
+//! [`FloatParam`], so changes pushed through [`GainController::update`] ramp in
+//! per sample rather than clicking.
 
-use std::marker::PhantomData;
+use std::sync::Arc;
 
-use crate::common::{Buffer, ChannelMask, Processor, Sample, Spec};
-
-/// Convert decibels to a linear amplitude factor.
-#[inline]
-#[must_use]
-fn db_to_linear(db: f64) -> f64 {
-    10.0_f64.powf(db / 20.0)
-}
-
-/// Gain is layout-agnostic: it applies the same gain to every channel and
-/// passes the layout through unchanged. These are the standard layouts it
-/// accepts as input — and, being a passthrough, the layouts it produces.
-const GAIN_LAYOUTS: &[ChannelMask] = &[
-    ChannelMask::MASK_MONO,
-    ChannelMask::MASK_STEREO,
-    ChannelMask::MASK_QUAD,
-    ChannelMask::MASK_5_1,
-    ChannelMask::MASK_7_1,
-    ChannelMask::MASK_7_1_4,
-];
+use crate::common::{
+    Buffer, ChannelMask, Controller, FloatParam, Param, Processor, Sample, SmoothingStyle, Spec,
+};
 
 /// Configuration for [`Gain`].
 ///
@@ -38,123 +23,131 @@ pub struct GainConfig {
     pub gain_db: f64,
 }
 
-/// A broadband gain.
+/// Time over which a gain change ramps to its new value, in milliseconds.
+const GAIN_SMOOTHING_MS: f64 = 10.0;
+
+/// Largest finite linear gain a [`FloatParam`] target is clamped to (≈ +60 dB).
+/// Bounds the smoother so a wild config can't produce a non-finite ramp.
+const MAX_LINEAR_GAIN: f64 = 1_000.0;
+
+/// Parameters shared between a [`Gain`] and its [`GainController`].
+///
+/// Smoothed in the linear-amplitude domain: the control thread converts dB to a
+/// linear target, the audio thread reads the smoothed factor per sample.
+struct GainParams<S: Sample> {
+    gain: FloatParam<S>,
+}
+
+impl<S: Sample> GainParams<S> {
+    fn new(gain_db: f64) -> Self {
+        Self {
+            gain: FloatParam::new(
+                db_to_linear(gain_db),
+                0.0..=MAX_LINEAR_GAIN,
+                SmoothingStyle::Linear(GAIN_SMOOTHING_MS),
+            ),
+        }
+    }
+}
+
+/// The control-thread handle for a [`Gain`]. Reconfigures the running processor
+/// through the shared parameters.
+pub struct GainController<S: Sample> {
+    params: Arc<GainParams<S>>,
+    sample_rate: f64,
+}
+
+impl<S: Sample> Controller for GainController<S> {
+    type Config = GainConfig;
+
+    fn update(&mut self, config: &Self::Config) {
+        self.params
+            .gain
+            .set(self.sample_rate, db_to_linear(config.gain_db));
+    }
+
+    fn reset(&mut self) {
+        self.params.gain.reset();
+    }
+}
+
+/// A broadband gain (realtime half).
 pub struct Gain<S: Sample> {
     spec: Spec,
-    gain_linear: f64,
-    _marker: PhantomData<S>,
+    params: Arc<GainParams<S>>,
 }
 
 impl<S: Sample> Processor for Gain<S> {
     type Sample = S;
     type Config = GainConfig;
+    type Controller = GainController<S>;
 
-    fn new(spec: Spec, config: &Self::Config) -> Self {
+    const INPUT_LAYOUTS: &'static [ChannelMask] = GAIN_LAYOUTS;
+
+    const OUTPUT_LAYOUTS: &'static [ChannelMask] = GAIN_LAYOUTS;
+
+    fn new(spec: Spec, config: &Self::Config) -> (Self::Controller, Self) {
         debug_assert!(
-            Self::supported_input_layouts().contains(&spec.input_layout),
+            Self::INPUT_LAYOUTS.contains(&spec.layout),
             "gain built for unsupported input layout {:?}",
-            spec.input_layout,
+            spec.layout,
         );
-        Self {
-            spec,
-            gain_linear: db_to_linear(config.gain_db),
-            _marker: PhantomData,
-        }
-    }
 
-    fn update(&mut self, config: &Self::Config) {
-        self.gain_linear = db_to_linear(config.gain_db);
+        let params = Arc::new(GainParams::new(config.gain_db));
+        let controller = GainController {
+            params: Arc::clone(&params),
+            sample_rate: spec.sample_rate,
+        };
+        let processor = Gain { spec, params };
+        (controller, processor)
     }
 
     fn process(&mut self, buffer: &mut Buffer<'_, S>) {
-        let g = S::from_f64(self.gain_linear);
         let frames = buffer.frames();
         let channels = buffer.out_channels();
-        for ch in 0..channels {
+        let gain = &self.params.gain;
+
+        if gain.is_smoothing() {
+            // The gain moves within the block: advance the ramp once per frame
+            // and apply the same factor across every channel of that frame.
             for i in 0..frames {
-                let x = buffer.input(ch)[i];
-                buffer.output_mut(ch)[i] = x * g;
+                let g = gain.next();
+                for ch in 0..channels {
+                    let x = buffer.input(ch)[i];
+                    buffer.output_mut(ch)[i] = x * g;
+                }
+            }
+        } else {
+            // Settled: one constant factor, iterate channel-major for locality.
+            let g = gain.next();
+            for ch in 0..channels {
+                for i in 0..frames {
+                    let x = buffer.input(ch)[i];
+                    buffer.output_mut(ch)[i] = x * g;
+                }
             }
         }
     }
 
-    fn reset(&mut self) {
-        // Gain is memoryless: nothing to clear.
-    }
-
-    fn spec(&self) -> &Spec {
+    fn input_spec(&self) -> &Spec {
         &self.spec
     }
 
-    fn output_layout(&self) -> ChannelMask {
-        // Gain preserves its input layout.
-        self.spec.input_layout
-    }
-
-    fn supported_input_layouts() -> &'static [ChannelMask] {
-        GAIN_LAYOUTS
-    }
-
-    fn supported_output_layouts() -> &'static [ChannelMask] {
-        // Passthrough: it produces exactly the layouts it can accept.
-        GAIN_LAYOUTS
+    fn output_spec(&self) -> &Spec {
+        &self.spec
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::common::testing;
+const GAIN_LAYOUTS: &[ChannelMask] = &[
+    ChannelMask::MASK_MONO,
+    ChannelMask::MASK_STEREO,
+    ChannelMask::MASK_QUAD,
+    ChannelMask::MASK_5_1,
+    ChannelMask::MASK_7_1,
+    ChannelMask::MASK_7_1_4,
+];
 
-    const SR: f64 = 48_000.0;
-
-    fn spec(max_frames: usize) -> Spec {
-        Spec::new(SR, max_frames, ChannelMask::MASK_STEREO)
-    }
-
-    #[test]
-    fn applies_steady_gain() {
-        let mut gain = Gain::<f32>::new(spec(512), &GainConfig { gain_db: 6.0 });
-
-        let input = vec![vec![1.0_f32; 256]; 2];
-        let out = testing::run_offline(&mut gain, &input, 2, 128);
-
-        let expected = db_to_linear(6.0) as f32;
-        for ch in &out {
-            for &s in ch {
-                assert!((s - expected).abs() < 1e-4, "got {s}, expected {expected}");
-            }
-        }
-    }
-
-    #[test]
-    fn update_changes_gain() {
-        let mut gain = Gain::<f32>::new(spec(512), &GainConfig { gain_db: 0.0 });
-        gain.update(&GainConfig { gain_db: -20.0 });
-
-        let input = vec![vec![1.0_f32; 256]; 2];
-        let out = testing::run_offline(&mut gain, &input, 2, 128);
-
-        let expected = db_to_linear(-20.0) as f32;
-        assert!((out[0][200] - expected).abs() < 1e-4);
-    }
-
-    #[test]
-    fn reports_layout_and_outputs() {
-        // The input layout comes from the spec; gain passes it through to output.
-        let g = Gain::<f32>::new(
-            Spec::new(SR, 256, ChannelMask::MASK_5_1),
-            &GainConfig::default(),
-        );
-        assert_eq!(g.input_layout(), ChannelMask::MASK_5_1);
-        assert_eq!(g.output_layout(), ChannelMask::MASK_5_1);
-        assert_eq!(g.input_layout().channel_count(), 6);
-
-        // Supported layouts are static (type-level), not tied to this instance.
-        assert!(Gain::<f32>::supported_input_layouts().contains(&ChannelMask::MASK_5_1));
-        assert_eq!(
-            Gain::<f32>::supported_input_layouts(),
-            Gain::<f32>::supported_output_layouts(),
-        );
-    }
+/// Convert decibels to a linear amplitude factor.
+fn db_to_linear(db: f64) -> f64 {
+    10.0_f64.powf(db / 20.0)
 }

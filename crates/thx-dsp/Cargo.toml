@@ -6,9 +6,7 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
-bitflags = "2"
+bitflags = "2.13"
 
-[features]
-# Opt-in instrumentation utilities (signal generators, offline drivers, analyzers).
-# Always available to the crate's own tests; gate it on for external test crates.
-testing = []
+[dev-dependencies]
+assert_no_alloc = "1.1"

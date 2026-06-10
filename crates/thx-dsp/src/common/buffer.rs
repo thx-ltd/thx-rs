@@ -1,6 +1,6 @@
 //! Planar (deinterleaved) audio buffer.
 //!
-//! A [`Buffer`] is the unit of work handed to [`Processor::process`]. It exposes
+//! A [`Buffer`] is the unit of work handed to [`Processor::process`](super::Processor::process). It exposes
 //! a read-only **input** view (`N_in` channels) and a writable **output** view
 //! (`N_out` channels).
 //!
