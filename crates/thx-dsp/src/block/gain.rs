@@ -1,17 +1,16 @@
-//! [`Gain`]: a broadband gain, the proof-of-concept implementation of the
-//! [`Processor`] / [`Controller`] split.
+//! [`Gain`]: a broadband gain, the reference implementation of the
+//! [`Block`] / [`Processor`] / [`Controller`] split.
 //!
 //! It applies the same gain to every channel of its layout, passing the layout
 //! straight through to the output. Layout-agnostic in behaviour but, like every
-//! processor, built for one concrete input layout. The gain is a smoothed
+//! block, built for one concrete input layout. The gain is a smoothed
 //! [`FloatParam`], so changes pushed through [`GainController::update`] ramp in
 //! per sample rather than clicking.
 
 use std::sync::Arc;
 
-use crate::common::{
-    Buffer, ChannelMask, Controller, FloatParam, Param, Processor, Sample, SmoothingStyle, Spec,
-};
+use super::{Block, Controller, Error, Processor, Result, Spec};
+use crate::common::{Buffer, ChannelMask, FloatParam, Param, Sample, SmoothingStyle};
 
 /// Configuration for [`Gain`].
 #[derive(Clone, Debug, Default)]
@@ -20,7 +19,7 @@ pub struct GainConfig {
     pub gain_db: f64,
 }
 
-/// Internal Parameters of a [`Gain`], shared between the processor and its
+/// Internal parameters of a [`Gain`], shared between the processor and its
 /// controller.
 struct GainParams<S: Sample> {
     gain_lin: FloatParam<S>,
@@ -55,46 +54,35 @@ pub struct GainController<S: Sample> {
 impl<S: Sample> Controller for GainController<S> {
     type Config = GainConfig;
 
-    fn update(&mut self, spec: Spec, config: &Self::Config) {
-        self.spec = spec;
-        self.params.set(&self.spec, config);
+    fn update(&mut self, spec: &Spec, config: &Self::Config) -> Result<Self::Config> {
+        if !GAIN_LAYOUTS.contains(&spec.layout) {
+            return Err(Error::UnsupportedLayout(spec.layout));
+        }
+        self.spec = *spec;
+        self.params.set(spec, config);
+        Ok(config.clone())
     }
 
     fn reset(&mut self) {
         self.params.gain_lin.reset();
     }
+
+    fn input_spec(&self) -> &Spec {
+        &self.spec
+    }
+
+    fn output_spec(&self) -> &Spec {
+        &self.spec
+    }
 }
 
 /// The audio-thread processor for a [`Gain`].
 pub struct Gain<S: Sample> {
-    spec: Spec,
     params: Arc<GainParams<S>>,
 }
 
 impl<S: Sample> Processor for Gain<S> {
     type Sample = S;
-    type Config = GainConfig;
-    type Controller = GainController<S>;
-
-    const INPUT_LAYOUTS: &'static [ChannelMask] = GAIN_LAYOUTS;
-
-    const OUTPUT_LAYOUTS: &'static [ChannelMask] = GAIN_LAYOUTS;
-
-    fn new(spec: Spec, config: &Self::Config) -> (Self::Controller, Self) {
-        debug_assert!(
-            Self::INPUT_LAYOUTS.contains(&spec.layout),
-            "gain built for unsupported input layout {:?}",
-            spec.layout,
-        );
-
-        let params = Arc::new(GainParams::new(config));
-        let controller = GainController {
-            params: Arc::clone(&params),
-            spec,
-        };
-        let processor = Gain { spec, params };
-        (controller, processor)
-    }
 
     fn process(&mut self, buffer: &mut Buffer<'_, S>) {
         let frames = buffer.frames();
@@ -110,13 +98,34 @@ impl<S: Sample> Processor for Gain<S> {
             }
         }
     }
+}
 
-    fn input_spec(&self) -> &Spec {
-        &self.spec
-    }
+impl<S: Sample> Block for Gain<S> {
+    type Sample = S;
+    type Config = GainConfig;
+    type Processor = Gain<S>;
+    type Controller = GainController<S>;
 
-    fn output_spec(&self) -> &Spec {
-        &self.spec
+    const INPUT_LAYOUTS: &'static [ChannelMask] = GAIN_LAYOUTS;
+    const OUTPUT_LAYOUTS: &'static [ChannelMask] = GAIN_LAYOUTS;
+    const NAME: &'static str = "Gain";
+    const DESCRIPTION: &'static str =
+        "Broadband gain applied uniformly across all channels.";
+
+    fn new(spec: &Spec, config: &Self::Config) -> (Gain<S>, GainController<S>) {
+        debug_assert!(
+            GAIN_LAYOUTS.contains(&spec.layout),
+            "gain built for unsupported input layout {:?}",
+            spec.layout,
+        );
+
+        let params = Arc::new(GainParams::new(config));
+        let controller = GainController {
+            params: Arc::clone(&params),
+            spec: *spec,
+        };
+        let processor = Gain { params };
+        (processor, controller)
     }
 }
 

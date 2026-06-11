@@ -5,16 +5,16 @@ mod runner;
 #[path = "utils/signal.rs"]
 mod signal;
 
-use thx_dsp::{Buffer, ChannelMask, Controller, Gain, GainConfig, Processor, Spec};
+use thx_dsp::{Block, Buffer, ChannelMask, Controller, Gain, GainConfig, Processor, Spec};
 
 #[test]
 fn gain_applies_and_updates() {
     let spec = Spec::new(48_000.0, 256, ChannelMask::MASK_STEREO);
-    let (mut controller, mut gain) = Gain::<f32>::new(spec, &GainConfig { gain_db: 0.0 });
+    let (mut gain, mut controller) = Gain::<f32>::new(&spec, &GainConfig { gain_db: 0.0 });
 
     // Reconfigure to -20 dB (0.1 linear), then snap past the ramp so we can
     // assert the settled value rather than a point on the smoothing curve.
-    controller.update(spec, &GainConfig { gain_db: -20.0 });
+    controller.update(&spec, &GainConfig { gain_db: -20.0 }).unwrap();
     controller.reset();
 
     let input = vec![vec![1.0_f32; 256]; 2];
@@ -41,8 +41,8 @@ fn gain_change_ramps_in() {
     let spec = Spec::new(48_000.0, 256, ChannelMask::MASK_STEREO);
     // Start at unity (settled), then move to -20 dB without resetting: the first
     // block should ramp from ~1.0 toward 0.1 rather than jumping.
-    let (mut controller, mut gain) = Gain::<f32>::new(spec, &GainConfig { gain_db: 0.0 });
-    controller.update(spec, &GainConfig { gain_db: -20.0 });
+    let (mut gain, mut controller) = Gain::<f32>::new(&spec, &GainConfig { gain_db: 0.0 });
+    controller.update(&spec, &GainConfig { gain_db: -20.0 }).unwrap();
 
     let input = vec![vec![1.0_f32; 256]; 2];
     let mut output = vec![vec![0.0_f32; 256]; 2];
@@ -67,8 +67,8 @@ fn gain_settles_through_offline_driver() {
     // Drives the processor in fixed blocks via `run_offline`, which also asserts
     // `process` never allocates (the no-alloc guard is always on in tests).
     let spec = Spec::new(48_000.0, 64, ChannelMask::MASK_MONO);
-    let (mut controller, mut gain) = Gain::<f32>::new(spec, &GainConfig { gain_db: -6.0 });
-    controller.update(spec, &GainConfig { gain_db: -6.0 });
+    let (mut gain, mut controller) = Gain::<f32>::new(&spec, &GainConfig { gain_db: -6.0 });
+    controller.update(&spec, &GainConfig { gain_db: -6.0 }).unwrap();
 
     let input = vec![vec![1.0_f32; 4096]];
     let output = run_offline(&mut gain, &input, 1, 64);
@@ -80,4 +80,16 @@ fn gain_settles_through_offline_driver() {
         "expected settled -6 dB, got {}",
         output[0][4095]
     );
+}
+
+#[test]
+fn update_rejects_unsupported_layout() {
+    use thx_dsp::Error;
+
+    let spec = Spec::new(48_000.0, 256, ChannelMask::MASK_STEREO);
+    let (_gain, mut controller) = Gain::<f32>::new(&spec, &GainConfig::default());
+
+    let bad_spec = Spec::new(48_000.0, 256, ChannelMask::FRONT_LEFT);
+    let err = controller.update(&bad_spec, &GainConfig::default()).unwrap_err();
+    assert!(matches!(err, Error::UnsupportedLayout(_)));
 }

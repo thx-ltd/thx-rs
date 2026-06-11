@@ -35,10 +35,9 @@ use super::sample::Sample;
 ///
 /// The lifetime `'a` ties the view to the borrowed channel storage.
 pub struct Buffer<'a, S: Sample> {
-    input: &'a [&'a [S]],
-    output: &'a mut [&'a mut [S]],
-    capacity: usize,
+    data: &'a mut [&'a mut [S]],
     frames: usize,
+    stride: usize,
 }
 
 impl<'a, S: Sample> Buffer<'a, S> {
