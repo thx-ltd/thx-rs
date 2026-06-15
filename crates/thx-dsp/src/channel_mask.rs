@@ -126,7 +126,7 @@ impl ChannelMask {
 
     /// Iterates the speaker positions present in this mask in canonical
     /// (ascending-bit) order, the same order channels should appear in a planar
-    /// [`Buffer`](crate::common::Buffer). Each item is a single-position mask.
+    /// [`Buffer`](crate::Buffer). Each item is a single-position mask.
     pub fn positions(self) -> impl Iterator<Item = ChannelMask> {
         self.iter()
     }
@@ -144,6 +144,18 @@ impl ChannelMask {
         // Count set positions below the queried bit.
         let below = self.bits() & (position.bits() - 1);
         Some(below.count_ones() as usize)
+    }
+}
+
+impl serde::Serialize for ChannelMask {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u32(self.bits())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ChannelMask {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        u32::deserialize(deserializer).map(Self::from_bits_retain)
     }
 }
 

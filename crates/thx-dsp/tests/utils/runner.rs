@@ -4,49 +4,60 @@
 //! Not every test uses it, so unused-code warnings are silenced here.
 #![allow(dead_code)]
 
-use thx_dsp::{Buffer, Processor, Sample};
+use thx_dsp::{Block, BlockProcessor, BlockSignal, Buffer, Sample, Spec};
 
 // Route this test binary's allocator through `assert_no_alloc` so that any heap
-// allocation inside a guarded region (see `run_offline`) aborts. It only triggers
-// inside the guard; allocation elsewhere behaves normally.
+// allocation inside a guarded region (see `run_offline`) aborts. It only
+// triggers inside the guard; allocation elsewhere behaves normally.
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
-/// Drive `processor` over a planar `input` signal in fixed-size blocks,
+/// Drive `processor` over a planar `input` signal in fixed-size blocks at `spec`,
 /// returning the planar output (`out_channels` channels).
 ///
-/// Deterministic and single-threaded: the same `input` always yields the same
-/// output, which is what makes processor behaviour unit-testable. `block` is the
-/// per-call frame count; it must not exceed the processor's `max_frames`. Each
-/// `process` call runs inside an `assert_no_alloc` guard, so a processor that
-/// allocates on the audio path aborts the test.
-pub fn run_offline<P: Processor>(
-    processor: &mut P,
-    input: &[Vec<P::Sample>],
+/// Deterministic and single-threaded, so the same `input` always yields the same
+/// output. `block` is the per-call frame count and must not exceed the
+/// `max_frames` the processor was built for. Each `process` call runs inside an
+/// `assert_no_alloc` guard, so a processor that allocates on the audio path
+/// aborts the test.
+pub fn run_offline<S: Sample, B: Block<S>>(
+    processor: &mut BlockProcessor<S, B>,
+    input: &[Vec<S>],
+    spec: Spec,
     out_channels: usize,
     block: usize,
-) -> Vec<Vec<P::Sample>> {
+) -> Vec<Vec<S>> {
     let block = block.max(1);
     let in_channels = input.len();
     let total = input.iter().map(Vec::len).min().unwrap_or(0);
 
-    let mut output = vec![vec![<P::Sample as Sample>::ZERO; total]; out_channels];
+    // All allocation happens out here, before the realtime guard.
+    let mut in_sig = BlockSignal {
+        spec,
+        buffer: Buffer::<S>::new(in_channels, block),
+    };
+    let mut out_sig = BlockSignal {
+        spec,
+        buffer: Buffer::<S>::new(out_channels, block),
+    };
+    let mut output: Vec<Vec<S>> = vec![Vec::with_capacity(2 * total); out_channels];
 
     let mut pos = 0;
     while pos < total {
         let n = block.min(total - pos);
+        in_sig.buffer.set_frames(n);
+        for (ch, channel) in input.iter().enumerate() {
+            in_sig.buffer.channel_mut(ch).copy_from_slice(&channel[pos..pos + n]);
+        }
+        // Engine convention: output frames default to input frames; the block
+        // may override (e.g. a resampler).
+        out_sig.buffer.set_frames(n);
 
-        let in_refs: Vec<&[P::Sample]> =
-            (0..in_channels).map(|c| &input[c][pos..pos + n]).collect();
-        let mut out_windows: Vec<&mut [P::Sample]> =
-            output.iter_mut().map(|c| &mut c[pos..pos + n]).collect();
+        assert_no_alloc::assert_no_alloc(|| processor.process(&in_sig, &mut out_sig));
 
-        let mut buffer_view = Buffer::new(&in_refs, &mut out_windows, n);
-
-        // `process` must be realtime-safe; prove it allocates nothing by running
-        // it inside the no-alloc guard.
-        assert_no_alloc::assert_no_alloc(|| processor.process(&mut buffer_view));
-
+        for (ch, collected) in output.iter_mut().enumerate() {
+            collected.extend_from_slice(out_sig.buffer.channel(ch));
+        }
         pos += n;
     }
 

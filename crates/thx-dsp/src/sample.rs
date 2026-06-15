@@ -3,7 +3,7 @@
 //! Processors are generic over `S: Sample` so the same DSP code can run in
 //! `f32` or `f64` without duplication.
 
-use core::ops::{Add, Mul, Sub};
+use core::ops::{Add, Mul, Neg, Sub};
 
 /// A scalar audio sample.
 ///
@@ -14,9 +14,11 @@ pub trait Sample:
     + Sync
     + 'static
     + core::fmt::Debug
+    + PartialOrd
     + Add<Output = Self>
     + Sub<Output = Self>
     + Mul<Output = Self>
+    + Neg<Output = Self>
 {
     const ZERO: Self;
     const ONE: Self;
