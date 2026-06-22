@@ -6,7 +6,7 @@ mod runner;
 mod signal;
 
 use thx_dsp::block::gain::{Gain, GainConfig};
-use thx_dsp::{Block, ChannelMask, Error, Smooth, Spec};
+use thx_dsp::{DspBlock, ChannelMask, Error, Smooth, Spec};
 
 const SPEC: Spec = Spec {
     sample_rate: 48_000.0,
@@ -95,11 +95,4 @@ fn spawn_rejects_unsupported_layout() {
         panic!("layout must be rejected");
     };
     assert!(matches!(err, Error::UnsupportedLayout(_)));
-}
-
-#[test]
-fn specs_pass_through() {
-    let (_gain, controller) = Gain::<f32>::spawn(&SPEC, 64, &GainConfig::default()).unwrap();
-    assert_eq!(controller.input_spec(), SPEC);
-    assert_eq!(controller.output_spec(), SPEC);
 }

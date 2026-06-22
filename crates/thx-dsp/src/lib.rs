@@ -9,12 +9,15 @@ pub mod channel_mask;
 pub mod sample;
 pub mod smooth;
 pub mod spec;
+pub mod utils;
 
 pub use block::{
-    Block, BlockController, BlockDescription, BlockProcessor, BlockSignal, Config, Error, Result,
+    DspBlock, DspBlockController, DspBlockDescription, DspBlockProcessor, DspBlockSignal, DspConfig,
+    Error, Result,
 };
 pub use buffer::Buffer;
 pub use channel_mask::ChannelMask;
 pub use sample::Sample;
 pub use smooth::{Param, Smooth};
 pub use spec::Spec;
+pub use utils::db_to_linear;

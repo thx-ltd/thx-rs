@@ -1,7 +1,7 @@
-//! The framework runtime: the lock-free pair every [`Block`] is split into.
+//! The framework runtime: the lock-free pair every [`DspBlock`] is split into.
 //!
-//! [`spawn`] produces a [`BlockProcessor`] (audio thread) and a
-//! [`BlockController`] (control thread) — the two ends of a lock-free wire.
+//! [`spawn`] produces a [`DspBlockProcessor`] (audio thread) and a
+//! [`DspBlockController`] (control thread) — the two ends of a lock-free wire.
 //! Config snapshots cross via `triple_buffer`; enable/reset cross via atomics.
 //! No locks, no audio-thread allocation.
 //!
@@ -19,44 +19,56 @@ use crate::buffer::Buffer;
 use crate::sample::Sample;
 use crate::spec::Spec;
 
-use super::{Block, BlockSignal, Result};
+use super::{DspBlock, DspBlockSignal, Error, Result};
 
 /// Lock-free control signals shared across the thread boundary.
 struct Shared {
     enabled: AtomicBool,
-    reset_gen: AtomicU32,
+    /// Monotonic count of reset requests; the audio thread resets whenever this
+    /// runs ahead of the count it has already handled.
+    reset_requests: AtomicU32,
 }
 
 /// Audio-thread half of a spawned block: the block plus the universal bypass
 /// crossfade.
 ///
 /// [`process`](Self::process) drains the latest config/reset/enable signals, then
-/// runs the inner [`Block::process`] — straight through when enabled, as a
+/// runs the inner [`DspBlock::process`] — straight through when enabled, as a
 /// bit-exact passthrough when bypassed, or as a click-free crossfade in between.
-pub struct BlockProcessor<S: Sample, B: Block<S>> {
+pub struct DspBlockProcessor<S: Sample, B: DspBlock<S>> {
     block: B,
     rx: Output<B::Config>,
     shared: Arc<Shared>,
     /// Scratch for the processed ("wet") signal during a crossfade.
-    wet: BlockSignal<S>,
+    wet: DspBlockSignal<S>,
     /// Wet weight in `0.0..=1.0`: 1.0 = fully processed, 0.0 = fully bypassed.
     fade: f64,
     /// Per-sample fade increment.
     fade_step: f64,
-    seen_reset: u32,
+    /// Reset count this processor has already applied, diffed against
+    /// [`Shared::reset_requests`] each block.
+    handled_resets: u32,
 }
 
-impl<S: Sample, B: Block<S>> BlockProcessor<S, B> {
+impl<S: Sample, B: DspBlock<S>> DspBlockProcessor<S, B> {
     /// Process one block, reading `input` and writing `output`. Audio thread.
-    pub fn process(&mut self, input: &BlockSignal<S>, output: &mut BlockSignal<S>) {
+    pub fn process(&mut self, input: &DspBlockSignal<S>, output: &mut DspBlockSignal<S>) {
+        if !B::accepts(&input.spec) {
+            // A spec the block can't handle. `process` has no fallible path, so
+            // pass audio through untouched rather than produce garbage.
+            output.spec = input.spec;
+            output.buffer.copy_from(&input.buffer);
+            return;
+        }
+
         if self.rx.update() {
             let config = self.rx.output_buffer_mut();
             self.block.configure(config);
         }
 
-        let generation = self.shared.reset_gen.load(Ordering::Acquire);
-        if generation != self.seen_reset {
-            self.seen_reset = generation;
+        let requested = self.shared.reset_requests.load(Ordering::Acquire);
+        if requested != self.handled_resets {
+            self.handled_resets = requested;
             self.block.reset();
         }
 
@@ -84,6 +96,7 @@ impl<S: Sample, B: Block<S>> BlockProcessor<S, B> {
                 let dry = input.buffer.channel(ch);
                 let wet = self.wet.buffer.channel(ch);
                 let out = output.buffer.channel_mut(ch);
+                // TODO: SIMD Opportunity
                 for k in 0..frames {
                     let g = (start + delta * (k + 1) as f64).clamp(0.0, 1.0);
                     out[k] = dry[k] * S::from_f64(1.0 - g) + wet[k] * S::from_f64(g);
@@ -95,17 +108,15 @@ impl<S: Sample, B: Block<S>> BlockProcessor<S, B> {
 }
 
 /// Control-thread half of a spawned block: retune, bypass, reset, and inspect a
-/// running block. Every method here drives the [`BlockProcessor`] lock-free.
-pub struct BlockController<S: Sample, B: Block<S>> {
+/// running block. Every method here drives the [`DspBlockProcessor`] lock-free.
+pub struct DspBlockController<S: Sample, B: DspBlock<S>> {
     config: B::Config,
     tx: Input<B::Config>,
     shared: Arc<Shared>,
-    input_spec: Spec,
-    output_spec: Spec,
     _marker: PhantomData<S>,
 }
 
-impl<S: Sample, B: Block<S>> BlockController<S, B> {
+impl<S: Sample, B: DspBlock<S>> DspBlockController<S, B> {
     /// Validate and apply a new config, returning the effective (normalized) one.
     pub fn update(&mut self, config: &B::Config) -> Result<B::Config> {
         let effective = B::validate(config)?;
@@ -121,60 +132,52 @@ impl<S: Sample, B: Block<S>> BlockController<S, B> {
 
     /// Reset the block's internal state at the start of its next block.
     pub fn reset(&self) {
-        self.shared.reset_gen.fetch_add(1, Ordering::Release);
+        self.shared.reset_requests.fetch_add(1, Ordering::Release);
     }
 
     /// The last applied effective config.
     pub fn config(&self) -> &B::Config {
         &self.config
     }
-
-    /// The spec the block consumes.
-    pub fn input_spec(&self) -> Spec {
-        self.input_spec
-    }
-
-    /// The spec the block produces.
-    pub fn output_spec(&self) -> Spec {
-        self.output_spec
-    }
 }
 
-/// Build the `(processor, controller)` pair for a block. See [`Block::spawn`].
-pub fn spawn<S: Sample, B: Block<S>>(
+/// Build the `(processor, controller)` pair for a block. See [`DspBlock::spawn`].
+pub fn spawn<S: Sample, B: DspBlock<S>>(
     spec: &Spec,
     max_frames: usize,
     config: &B::Config,
-) -> Result<(BlockProcessor<S, B>, BlockController<S, B>)> {
+) -> Result<(DspBlockProcessor<S, B>, DspBlockController<S, B>)> {
+    if !B::accepts(spec) {
+        return Err(Error::UnsupportedLayout(spec.layout));
+    }
+
     let effective = B::validate(config)?;
     let block = B::new(spec, max_frames, &effective)?;
     let output_spec = B::output_spec(spec, &effective);
 
     let shared = Arc::new(Shared {
         enabled: AtomicBool::new(true),
-        reset_gen: AtomicU32::new(0),
+        reset_requests: AtomicU32::new(0),
     });
     let (tx, rx) = triple_buffer::triple_buffer(&effective);
     let fade_len = (0.01 * spec.sample_rate).round().max(1.0) as usize;
 
-    let processor = BlockProcessor {
+    let processor = DspBlockProcessor {
         block,
         rx,
         shared: Arc::clone(&shared),
-        wet: BlockSignal {
+        wet: DspBlockSignal {
             spec: output_spec,
             buffer: Buffer::new(output_spec.channels(), max_frames),
         },
         fade: 1.0,
         fade_step: 1.0 / fade_len as f64,
-        seen_reset: 0,
+        handled_resets: 0,
     };
-    let controller = BlockController {
+    let controller = DspBlockController {
         config: effective,
         tx,
         shared,
-        input_spec: *spec,
-        output_spec,
         _marker: PhantomData,
     };
     Ok((processor, controller))

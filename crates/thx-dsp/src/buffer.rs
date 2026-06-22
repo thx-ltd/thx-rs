@@ -7,7 +7,7 @@
 //! audio thread.
 //!
 //! A block reads one buffer and writes another (carried by
-//! [`BlockSignal`](crate::BlockSignal)). Keeping input and output *separate* is
+//! [`DspBlockSignal`](crate::DspBlockSignal)). Keeping input and output *separate* is
 //! what lets it change layout (upmix/downmix) or frame count (resampling)
 //! without copies.
 //!

@@ -1,14 +1,15 @@
-//! [`Gain`]: a broadband gain — the reference [`Block`] implementation.
+//! [`Gain`]: a broadband gain — the reference [`DspBlock`] implementation.
 
 use std::marker::PhantomData;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Block, BlockDescription, BlockSignal, Error, Result};
+use super::{DspBlock, DspBlockDescription, DspBlockSignal, Result};
 use crate::channel_mask::ChannelMask;
 use crate::sample::Sample;
 use crate::smooth::Smooth;
 use crate::spec::Spec;
+use crate::utils::db_to_linear;
 
 /// Configuration for [`Gain`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -25,14 +26,12 @@ pub struct Gain<S: Sample> {
     _marker: PhantomData<S>,
 }
 
-impl<S: Sample> Block<S> for Gain<S> {
+impl<S: Sample> DspBlock<S> for Gain<S> {
     type Config = GainConfig;
 
     fn new(spec: &Spec, _max_frames: usize, config: &GainConfig) -> Result<Self> {
-        if !LAYOUTS.contains(&spec.layout) {
-            return Err(Error::UnsupportedLayout(spec.layout));
-        }
-        let mut config = Self::validate(config)?;
+        // The framework has already accepted `spec` and validated `config`.
+        let mut config = config.clone();
         config.gain_db.prepare(spec.sample_rate);
         Ok(Self {
             config,
@@ -40,8 +39,8 @@ impl<S: Sample> Block<S> for Gain<S> {
         })
     }
 
-    fn description() -> &'static BlockDescription {
-        &DESCRIPTOR
+    fn description() -> &'static DspBlockDescription {
+        &DESCRIPTION
     }
 
     fn validate(config: &GainConfig) -> Result<GainConfig> {
@@ -55,13 +54,15 @@ impl<S: Sample> Block<S> for Gain<S> {
         self.config.gain_db.set_target(config.gain_db.target());
     }
 
-    fn process(&mut self, input: &BlockSignal<S>, output: &mut BlockSignal<S>) {
+    fn process(&mut self, input: &DspBlockSignal<S>, output: &mut DspBlockSignal<S>) {
         output.spec = input.spec;
+
         let frames = input.buffer.frames();
         let channels = output.buffer.channels();
+
         for k in 0..frames {
             // One shared gain per frame, applied across every channel.
-            let gain = S::from_f64(db_to_linear(self.config.gain_db.advance()));
+            let gain = db_to_linear(S::from_f64(self.config.gain_db.advance()));
             for ch in 0..channels {
                 output.buffer.channel_mut(ch)[k] = input.buffer.channel(ch)[k] * gain;
             }
@@ -73,7 +74,7 @@ impl<S: Sample> Block<S> for Gain<S> {
     }
 }
 
-static DESCRIPTOR: BlockDescription = BlockDescription {
+static DESCRIPTION: DspBlockDescription = DspBlockDescription {
     name: "gain",
     description: "Broadband gain applied uniformly across all channels.",
     input_layouts: LAYOUTS,
@@ -88,8 +89,3 @@ const LAYOUTS: &[ChannelMask] = &[
     ChannelMask::MASK_7_1,
     ChannelMask::MASK_7_1_4,
 ];
-
-/// Convert decibels to a linear amplitude factor.
-fn db_to_linear(db: f64) -> f64 {
-    10.0_f64.powf(db / 20.0)
-}

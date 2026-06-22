@@ -4,7 +4,7 @@
 //! Not every test uses it, so unused-code warnings are silenced here.
 #![allow(dead_code)]
 
-use thx_dsp::{Block, BlockProcessor, BlockSignal, Buffer, Sample, Spec};
+use thx_dsp::{DspBlock, DspBlockProcessor, DspBlockSignal, Buffer, Sample, Spec};
 
 // Route this test binary's allocator through `assert_no_alloc` so that any heap
 // allocation inside a guarded region (see `run_offline`) aborts. It only
@@ -20,8 +20,8 @@ static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 /// `max_frames` the processor was built for. Each `process` call runs inside an
 /// `assert_no_alloc` guard, so a processor that allocates on the audio path
 /// aborts the test.
-pub fn run_offline<S: Sample, B: Block<S>>(
-    processor: &mut BlockProcessor<S, B>,
+pub fn run_offline<S: Sample, B: DspBlock<S>>(
+    processor: &mut DspBlockProcessor<S, B>,
     input: &[Vec<S>],
     spec: Spec,
     out_channels: usize,
@@ -32,11 +32,11 @@ pub fn run_offline<S: Sample, B: Block<S>>(
     let total = input.iter().map(Vec::len).min().unwrap_or(0);
 
     // All allocation happens out here, before the realtime guard.
-    let mut in_sig = BlockSignal {
+    let mut in_sig = DspBlockSignal {
         spec,
         buffer: Buffer::<S>::new(in_channels, block),
     };
-    let mut out_sig = BlockSignal {
+    let mut out_sig = DspBlockSignal {
         spec,
         buffer: Buffer::<S>::new(out_channels, block),
     };

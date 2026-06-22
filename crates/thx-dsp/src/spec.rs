@@ -10,7 +10,7 @@ use crate::channel_mask::ChannelMask;
 /// a resampler changes `sample_rate`, an upmixer changes `layout`. The
 /// engine-wide maximum block size is deliberately **not** part of the spec: it
 /// is fixed once for a whole engine and passed separately at construction time
-/// (see [`Block::new`](crate::block::Block::new)).
+/// (see [`DspBlock::new`](crate::block::DspBlock::new)).
 ///
 /// A spec is **immutable for the lifetime of a processor**: blocks are built
 /// for one concrete spec, which lets `process` pre-allocate everything and stay

@@ -1,5 +1,5 @@
 //! Integration tests: the click-free bypass crossfade every block gets for free
-//! through `BlockController::enable` — no author code, no wrapper to compose.
+//! through `DspBlockController::enable` — no author code, no wrapper to compose.
 
 #[path = "utils/runner.rs"]
 mod runner;
@@ -7,7 +7,7 @@ mod runner;
 mod signal;
 
 use thx_dsp::block::gain::{Gain, GainConfig};
-use thx_dsp::{Block, ChannelMask, Smooth, Spec};
+use thx_dsp::{DspBlock, ChannelMask, Smooth, Spec};
 
 const SPEC: Spec = Spec {
     sample_rate: 48_000.0,
