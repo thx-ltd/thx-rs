@@ -7,11 +7,9 @@ repository.workspace = true
 
 [dependencies]
 bitflags = { version = "2.13", features = ["serde"] }
-petgraph = "0.8"
-rtrb = "0.3"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-triple_buffer = "8"
+triple_buffer = "9"
 
 [dev-dependencies]
 assert_no_alloc = "1.1"
